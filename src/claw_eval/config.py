@@ -45,7 +45,6 @@ class ModelConfig(BaseModel):
     input_modalities: list[str] = Field(default_factory=lambda: ["text"])
     system_prompt_prefix: str | None = None
     extra_body: dict | None = None
-    context_window: int = 200_000
 
 
 class JudgeConfig(BaseModel):
@@ -53,6 +52,7 @@ class JudgeConfig(BaseModel):
     base_url: str = "https://openrouter.ai/api/v1"
     model_id: str = "google/gemini-2.5-flash"
     enabled: bool = True
+    extra_body: dict | None = None
 
 
 class DefaultsConfig(BaseModel):
@@ -130,13 +130,6 @@ class MediaConfig(BaseModel):
     max_files: int = 6
     max_bytes_per_file: int = 8 * 1024 * 1024
     image_max_dimension: int = 2048
-    # Tool-media injection settings (for sandbox_read_media / sandbox_pdf2image)
-    inject_tool_media: bool = True
-    max_images_per_turn: int = 16
-    max_tool_images_total: int = 64
-    video_frame_budget: int = 8
-    tool_image_quality: int = 60
-    tool_image_max_dimension: int = 768
 
 
 class Config(BaseModel):
