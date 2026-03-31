@@ -16,6 +16,32 @@ class JudgeResult(BaseModel):
     reasoning: str
 
 
+class _CompletionsWithExtraBody:
+    def __init__(self, completions, extra_body: dict | None) -> None:
+        self._completions = completions
+        self._extra_body = dict(extra_body or {})
+
+    def create(self, **kwargs):
+        if self._extra_body and "extra_body" not in kwargs:
+            kwargs["extra_body"] = self._extra_body
+        return self._completions.create(**kwargs)
+
+
+class _ClientWithExtraBody:
+    def __init__(self, client, extra_body: dict | None) -> None:
+        self._client = client
+        self.chat = type(
+            "_ChatWithExtraBody",
+            (),
+            {
+                "completions": _CompletionsWithExtraBody(
+                    client.chat.completions,
+                    extra_body,
+                )
+            },
+        )()
+
+
 _SYSTEM_PROMPT = """\
 You are an evaluation judge for an AI assistant.
 You will be given a task prompt, a conversation, a summary of actions taken, and a rubric.
@@ -23,25 +49,38 @@ Follow the rubric to score the assistant's response on a 0.0-1.0 scale.
 Respond with JSON only: {"score": <float>, "reasoning": "<brief explanation>"}
 """
 
-_VISUAL_SYSTEM_PROMPT = """\
-You are a STRICT visual evaluation judge. Your job is to compare candidate images \
-against reference images and/or a detailed rubric, then assign a score from 0.0 to 1.0.
 
-CRITICAL RULES:
-- You must be HARSH and PRECISE. Do NOT give generous scores.
-- If the rubric describes specific content (e.g., specific notes, pitches, patterns, \
-station names, colors), you MUST verify each detail. Getting the general layout right \
-but the specific content wrong should score LOW (0.1-0.3).
-- A visually "nice-looking" output that has WRONG content is a FAILURE.
-- Only score above 0.5 if the MAJORITY of rubric criteria are clearly satisfied.
-- Only score above 0.7 if the content is substantially correct with minor issues.
-- Only score above 0.9 if the output is nearly perfect.
-- Score 0.0-0.2 if the output is mostly wrong or unrecognizable.
-- When reference images are provided, compare the candidate DIRECTLY against them — \
-the reference is ground truth.
-
-Respond with JSON only: {"score": <float>, "reasoning": "<brief explanation>"}
-"""
+def _parse_judge_response(raw: str) -> JudgeResult:
+    raw = re.sub(r"^```(?:json)?\s*", "", raw.strip())
+    raw = re.sub(r"\s*```$", "", raw.strip())
+    m = re.search(r'\{[^{}]*\}', raw)
+    if m:
+        raw = m.group(0)
+    try:
+        parsed = json.loads(raw)
+        score = parsed["score"]
+        reasoning = parsed["reasoning"]
+    except json.JSONDecodeError:
+        score_m = re.search(r'"score"\s*:\s*([0-9.]+)', raw)
+        reason_m = re.search(r'"reasoning"\s*:\s*"((?:[^"\\]|\\.)*)"', raw)
+        if score_m:
+            score = float(score_m.group(1))
+            reasoning = reason_m.group(1) if reason_m else ""
+        else:
+            score_m = re.search(r"(?:score|评分|分数)\s*[:：]\s*([0-9.]+)", raw, re.I)
+            reason_m = re.search(
+                r"(?:reasoning|reason|理由)\s*[:：]\s*(.+)",
+                raw,
+                re.I | re.S,
+            )
+            if not score_m:
+                raise json.JSONDecodeError("No score found in raw", raw, 0)
+            score = float(score_m.group(1))
+            reasoning = reason_m.group(1).strip() if reason_m else ""
+    return JudgeResult(
+        score=max(0.0, min(1.0, float(score))),
+        reasoning=str(reasoning),
+    )
 
 
 class LLMJudge:
@@ -52,9 +91,12 @@ class LLMJudge:
         model_id: str = "google/gemini-2.5-flash",
         api_key: str | None = None,
         base_url: str = "https://openrouter.ai/api/v1",
+        extra_body: dict | None = None,
     ) -> None:
-        self.client = OpenAI(api_key=api_key or "dummy", base_url=base_url)
+        base_client = OpenAI(api_key=api_key or "dummy", base_url=base_url)
         self.model_id = model_id
+        self.extra_body = dict(extra_body or {})
+        self.client = _ClientWithExtraBody(base_client, self.extra_body)
 
     def evaluate(
         self,
@@ -82,132 +124,14 @@ class LLMJudge:
                     ],
                     temperature=0.0,
                     max_tokens=8192,
+                    extra_body=self.extra_body or None,
                 )
                 raw = resp.choices[0].message.content or "{}"
-                # Strip markdown code fences if present
-                raw = re.sub(r"^```(?:json)?\s*", "", raw.strip())
-                raw = re.sub(r"\s*```$", "", raw.strip())
-                m = re.search(r'\{[^{}]*\}', raw)
-                if m:
-                    raw = m.group(0)
-                try:
-                    parsed = json.loads(raw)
-                    score, reasoning = parsed["score"], parsed["reasoning"]
-                except json.JSONDecodeError:
-                    # Fallback: extract score and reasoning directly
-                    score_m = re.search(r'"score"\s*:\s*([0-9.]+)', raw)
-                    reason_m = re.search(r'"reasoning"\s*:\s*"((?:[^"\\]|\\.)*)"', raw)
-                    if score_m:
-                        parsed = {
-                            "score": float(score_m.group(1)),
-                            "reasoning": reason_m.group(1) if reason_m else "",
-                        }
-                    else:
-                        raise json.JSONDecodeError("No score found in raw", raw, 0)
-
-                return JudgeResult(
-                    score=max(0.0, min(1.0, float(score))),
-                    reasoning=str(reasoning),
-                )
+                return _parse_judge_response(raw)
             except Exception as exc:
                 last_exc = exc
                 status = getattr(exc, "status_code", None) or getattr(exc, "code", None)
                 delay = min(2 ** (attempt + 1), 8) + random.uniform(0, 1)
                 print(f"[judge-retry] ({status or type(exc).__name__}), "
-                      f"attempt {attempt + 1}/{max_retries}, waiting {delay:.1f}s ...")
-                time.sleep(delay)
-
-    def evaluate_visual(
-        self,
-        rubric: str,
-        reference_images_b64: list[str],
-        candidate_images_b64: list[str],
-        context: str = "",
-    ) -> JudgeResult:
-        """Evaluate visual similarity between reference and candidate images.
-
-        Constructs a message with inline base64 images for a vision-capable
-        judge model and returns a JudgeResult (score + reasoning).
-        """
-        content_parts: list[dict] = []
-
-        # Context / rubric text
-        header = "## Visual Evaluation\n"
-        if context:
-            header += f"{context}\n\n"
-        header += f"## Rubric\n{rubric}\n\n"
-        header += (
-            "## Scoring Calibration\n"
-            "- 0.0-0.2: Output is mostly wrong, unrecognizable, or missing most required content\n"
-            "- 0.2-0.4: Some elements present but major content errors (wrong notes, wrong colors, wrong layout)\n"
-            "- 0.4-0.6: General structure is right but significant content inaccuracies remain\n"
-            "- 0.6-0.8: Most content is correct with some minor issues\n"
-            "- 0.8-1.0: Content is substantially correct, matching reference closely\n\n"
-            "IMPORTANT: Looking nice is NOT enough. The CONTENT must be accurate. "
-            "Check each rubric criterion individually and sum up the weighted scores.\n\n"
-        )
-        header += "Below are reference images followed by candidate images.\n"
-        header += 'Respond with JSON only: {"score": <float>, "reasoning": "<brief explanation>"}'
-        content_parts.append({"type": "text", "text": header})
-
-        # Reference images
-        if reference_images_b64:
-            content_parts.append({"type": "text", "text": f"\n### Reference ({len(reference_images_b64)} images)"})
-            for img_b64 in reference_images_b64:
-                content_parts.append({
-                    "type": "image_url",
-                    "image_url": {"url": f"data:image/png;base64,{img_b64}"},
-                })
-
-        # Candidate images
-        if candidate_images_b64:
-            content_parts.append({"type": "text", "text": f"\n### Candidate ({len(candidate_images_b64)} images)"})
-            for img_b64 in candidate_images_b64:
-                content_parts.append({
-                    "type": "image_url",
-                    "image_url": {"url": f"data:image/png;base64,{img_b64}"},
-                })
-
-        max_retries = 20
-        last_exc: Exception | None = None
-        for attempt in range(max_retries + 1):
-            try:
-                resp = self.client.chat.completions.create(
-                    model=self.model_id,
-                    messages=[
-                        {"role": "system", "content": _VISUAL_SYSTEM_PROMPT},
-                        {"role": "user", "content": content_parts},
-                    ],
-                    temperature=0.0,
-                    max_tokens=8192,
-                )
-                raw = resp.choices[0].message.content or "{}"
-                raw = re.sub(r"^```(?:json)?\s*", "", raw.strip())
-                raw = re.sub(r"\s*```$", "", raw.strip())
-                m = re.search(r'\{[^{}]*\}', raw)
-                if m:
-                    raw = m.group(0)
-                try:
-                    parsed = json.loads(raw)
-                    score, reasoning = parsed["score"], parsed["reasoning"]
-                except json.JSONDecodeError:
-                    score_m = re.search(r'"score"\s*:\s*([0-9.]+)', raw)
-                    reason_m = re.search(r'"reasoning"\s*:\s*"((?:[^"\\]|\\.)*)"', raw)
-                    if score_m:
-                        score = float(score_m.group(1))
-                        reasoning = reason_m.group(1) if reason_m else ""
-                    else:
-                        raise json.JSONDecodeError("No score found in raw", raw, 0)
-                result = JudgeResult(
-                    score=max(0.0, min(1.0, float(score))),
-                    reasoning=str(reasoning),
-                )
-                print(f"[judge-visual] score={result.score:.2f} reasoning={result.reasoning[:200]}")
-                return result
-            except Exception as exc:
-                last_exc = exc
-                status = getattr(exc, "status_code", None) or getattr(exc, "code", None)
-                delay = min(2 ** (attempt + 1), 8) + random.uniform(0, 1)
-                print(f"[judge-visual-retry] ({status or type(exc).__name__}), "
                       f"attempt {attempt + 1}/{max_retries}, waiting {delay:.1f}s ...")
                 time.sleep(delay)
