@@ -116,32 +116,10 @@ def _collect_env_snapshot(sandbox_url: str, task) -> dict:
     """
     import httpx
 
-    timeout = getattr(task.environment, "env_snapshot_timeout", 10) if hasattr(task, "environment") else 10
-    client = httpx.Client(timeout=max(timeout + 5, 15.0))
+    client = httpx.Client(timeout=10.0)
     snapshot: dict = {}
 
     try:
-        # Run commands FIRST — they typically generate the files we need to collect
-        for cmd in getattr(task, "env_snapshot_commands", []):
-            try:
-                resp = client.post(
-                    f"{sandbox_url}/exec",
-                    json={"command": cmd, "timeout_seconds": timeout},
-                )
-                cmd_result = resp.json()
-                snapshot[f"cmd:{cmd}"] = cmd_result
-                # Debug: show command results
-                exit_code = cmd_result.get("exit_code", "?")
-                stdout = (cmd_result.get("stdout") or "")[:200]
-                stderr = (cmd_result.get("stderr") or "")[:200]
-                print(f"[env_snapshot] cmd exit={exit_code}: {cmd[:80]}")
-                if stderr:
-                    print(f"[env_snapshot]   stderr: {stderr}")
-            except Exception as exc:
-                snapshot[f"cmd:{cmd}"] = {"error": str(exc)}
-                print(f"[WARNING] env_snapshot command failed: {cmd}: {exc}")
-
-        # Collect files AFTER commands (commands may generate the files)
         for pattern in getattr(task, "env_snapshot_files", []):
             try:
                 if "*" in pattern or "?" in pattern:
@@ -150,7 +128,6 @@ def _collect_env_snapshot(sandbox_url: str, task) -> dict:
                         json={"pattern": pattern, "max_files": 50},
                     )
                     file_list = resp.json().get("files", [])
-                    print(f"[env_snapshot] glob '{pattern}' → {len(file_list)} file(s)")
                     for f in file_list:
                         try:
                             resp2 = client.post(
@@ -170,68 +147,21 @@ def _collect_env_snapshot(sandbox_url: str, task) -> dict:
             except Exception as exc:
                 snapshot[f"file:{pattern}"] = {"error": str(exc)}
                 print(f"[WARNING] env_snapshot file failed: {pattern}: {exc}")
+
+        for cmd in getattr(task, "env_snapshot_commands", []):
+            try:
+                resp = client.post(
+                    f"{sandbox_url}/exec",
+                    json={"command": cmd, "timeout_seconds": 10},
+                )
+                snapshot[f"cmd:{cmd}"] = resp.json()
+            except Exception as exc:
+                snapshot[f"cmd:{cmd}"] = {"error": str(exc)}
+                print(f"[WARNING] env_snapshot command failed: {cmd}: {exc}")
     finally:
         client.close()
 
     return snapshot
-
-
-def _save_env_snapshot(snapshot: dict, trace_path: Path, task_id: str) -> None:
-    """Persist env_snapshot artifacts alongside the trace for debugging.
-
-    Saves:
-    - PNG screenshots as individual files in <trace_dir>/<task_id>_snapshot/
-    - Command stdout/stderr as snapshot_commands.json
-    - A summary index as snapshot_index.json
-    """
-    import base64
-
-    if not snapshot:
-        return
-
-    snapshot_dir = trace_path.parent / f"{task_id}_snapshot"
-    snapshot_dir.mkdir(parents=True, exist_ok=True)
-
-    index: dict = {"files": [], "commands": []}
-
-    for key, entry in sorted(snapshot.items()):
-        if key.startswith("file:"):
-            path = key[len("file:"):]
-            if entry.get("encoding") == "base64" and entry.get("content"):
-                # Save binary file (e.g. PNG screenshot)
-                filename = Path(path).name
-                out_path = snapshot_dir / filename
-                try:
-                    out_path.write_bytes(base64.b64decode(entry["content"]))
-                    index["files"].append({"container_path": path, "saved_as": filename, "size": out_path.stat().st_size})
-                except Exception as exc:
-                    index["files"].append({"container_path": path, "error": str(exc)})
-            elif entry.get("error"):
-                index["files"].append({"container_path": path, "error": entry["error"]})
-            else:
-                # Text file — save as-is
-                filename = Path(path).name
-                out_path = snapshot_dir / filename
-                try:
-                    out_path.write_text(entry.get("content", ""), encoding="utf-8")
-                    index["files"].append({"container_path": path, "saved_as": filename})
-                except Exception as exc:
-                    index["files"].append({"container_path": path, "error": str(exc)})
-
-        elif key.startswith("cmd:"):
-            cmd = key[len("cmd:"):]
-            index["commands"].append({
-                "cmd": cmd,
-                "exit_code": entry.get("exit_code"),
-                "stdout": (entry.get("stdout") or "")[:2000],
-                "stderr": (entry.get("stderr") or "")[:2000],
-                "error": entry.get("error"),
-            })
-
-    # Write index
-    index_path = snapshot_dir / "snapshot_index.json"
-    index_path.write_text(json.dumps(index, indent=2, ensure_ascii=False))
-    print(f"[env_snapshot] saved {len(index['files'])} file(s) + {len(index['commands'])} cmd(s) → {snapshot_dir}")
 
 
 def _trace_totals(end) -> dict[str, int | float]:
@@ -349,26 +279,8 @@ def cmd_run(args: argparse.Namespace) -> None:
                         print(f"[WARNING] inject_grader_files: only {n_grader}/{len(task.sandbox_grader_files)} files injected")
                     # Collect env snapshot before destroying container
                     env_snapshot = _collect_env_snapshot(handle.sandbox_url, task)
-                    _save_env_snapshot(env_snapshot, trace_path, task.task_id)
                 finally:
                     runner.stop_container(handle)
-
-                # Read local grader files from host (GT files, never touched by agent)
-                if task.local_grader_files:
-                    import base64 as _b64
-                    task_root = Path(str(task_yaml.parent))
-                    for rel_path in task.local_grader_files:
-                        local_path = task_root / rel_path
-                        if local_path.exists():
-                            content = _b64.b64encode(local_path.read_bytes()).decode()
-                            env_snapshot[f"local_file:{rel_path}"] = {
-                                "encoding": "base64",
-                                "content": content,
-                            }
-                        else:
-                            env_snapshot[f"local_file:{rel_path}"] = {
-                                "error": f"not found: {local_path}",
-                            }
 
                 trace_paths.append(trace_path)
                 print(f"Trace: {trace_path}")
@@ -449,32 +361,12 @@ def cmd_run(args: argparse.Namespace) -> None:
             trace_paths_local.append(trace_path)
             print(f"Trace: {trace_path}")
 
-            # Read local grader files from host (GT files, never touched by agent)
-            env_snapshot: dict | None = None
-            if task.local_grader_files:
-                env_snapshot = {}
-                import base64 as _b64
-                task_root = Path(str(task_yaml.parent))
-                for rel_path in task.local_grader_files:
-                    local_path = task_root / rel_path
-                    if local_path.exists():
-                        content = _b64.b64encode(local_path.read_bytes()).decode()
-                        env_snapshot[f"local_file:{rel_path}"] = {
-                            "encoding": "base64",
-                            "content": content,
-                        }
-                    else:
-                        env_snapshot[f"local_file:{rel_path}"] = {
-                            "error": f"not found: {local_path}",
-                        }
-
             # Grade
             start, messages, dispatches, media_events, end, audit_data = load_trace(trace_path)
             grader = get_grader(task.task_id, tasks_dir=tasks_dir, task_dir=task_yaml.parent)
             scores = _grade_with_optional_params(
                 grader, messages, dispatches, task,
                 audit_data=audit_data, judge=judge, media_events=media_events,
-                env_snapshot=env_snapshot,
             )
             task_score = compute_task_score(scores)
             passed = is_pass(task_score)
@@ -743,6 +635,7 @@ def _run_single_task(
             model_id=judge_model or cfg.judge.model_id,
             api_key=cfg.judge.api_key,
             base_url=cfg.judge.base_url,
+            extra_body=cfg.judge.extra_body,
         )
 
     # Resolve sandbox mode
@@ -796,7 +689,6 @@ def _run_single_task(
                                 if task.sandbox_grader_files and n_grader < len(task.sandbox_grader_files):
                                     print(f"[WARNING] inject_grader_files: only {n_grader}/{len(task.sandbox_grader_files)} files injected")
                                 env_snapshot = _collect_env_snapshot(handle.sandbox_url, task)
-                                _save_env_snapshot(env_snapshot, trace_path, task.task_id)
                             finally:
                                 sandbox_runner.stop_container(handle)
                         else:
@@ -807,25 +699,6 @@ def _run_single_task(
                                 model_cfg=cfg.model,
                                 media_cfg=cfg.media,
                             )
-
-                        # Read local grader files from host (GT files, never touched by agent)
-                        if task.local_grader_files:
-                            if env_snapshot is None:
-                                env_snapshot = {}
-                            import base64 as _b64
-                            task_root = Path(task_dir)
-                            for rel_path in task.local_grader_files:
-                                local_path = task_root / rel_path
-                                if local_path.exists():
-                                    content = _b64.b64encode(local_path.read_bytes()).decode()
-                                    env_snapshot[f"local_file:{rel_path}"] = {
-                                        "encoding": "base64",
-                                        "content": content,
-                                    }
-                                else:
-                                    env_snapshot[f"local_file:{rel_path}"] = {
-                                        "error": f"not found: {local_path}",
-                                    }
 
                         start, messages, dispatches, media_events, end, audit_data = load_trace(trace_path)
                         grader = get_grader(task.task_id, tasks_dir=tasks_dir, task_dir=task_dir)
@@ -1078,15 +951,6 @@ def cmd_batch(args: argparse.Namespace) -> None:
     if args.filter:
         filt = args.filter.lower()
         task_dirs = [d for d in task_dirs if filt in d.lower()]
-
-    if args.tag:
-        from .models.task import TaskDefinition as _TD
-        filtered = []
-        for d in task_dirs:
-            td = _TD.from_yaml(Path(d) / "task.yaml")
-            if args.tag in td.tags:
-                filtered.append(d)
-        task_dirs = filtered
 
     # If rerunning errors, only keep the errored task dirs
     if errored_task_ids:
@@ -1520,7 +1384,6 @@ def main(argv: list[str] | None = None) -> None:
     p_batch = sub.add_parser("batch", help="Run all tasks in parallel")
     p_batch.add_argument("--tasks-dir", default="tasks", help="Tasks directory")
     p_batch.add_argument("--filter", default=None, help="Only run tasks matching this substring (e.g. 'en_' or 'T01')")
-    p_batch.add_argument("--tag", default=None, help="Only run tasks with this tag (e.g. 'multimodal', 'general')")
     p_batch.add_argument("--parallel", type=int, default=4, help="Number of parallel workers (default: 4)")
     p_batch.add_argument("--model", default=None)
     p_batch.add_argument("--api-key", default=None)
